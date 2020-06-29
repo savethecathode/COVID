@@ -1,0 +1,1422 @@
+---
+title: "COVID-19 Modeling: The Classic SIR Model"
+author: "Leo PeBenito"
+date: "6/25/2020"
+output: pdf_document
+bibliography: bibliography.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+setwd("~/COVID19/COVID19modeling")
+#load("~/.RData") # load data sets:
+library(tidyverse)
+library(lubridate)
+library(knitr)
+library(gridExtra)  # arrange figures
+```
+
+
+## Introduction
+
+Epidemiological models have a long history in the fight against infectious disease.
+In principle these models enable us to predict the onset of surges in the number of cases.
+The ability to anticipate health care needs based on this information allows medical institutions to prepare, and permits political officials to make timely policy recommendations.
+
+Here we develop an R implementation of the classic SIR model and apply it to the COVID-19 data for the United States curated by the Johns Hopkins University (JHU) Center for Systems Science and Engineering (CSSE).
+The JHU time series data is stored as cumulative case counts at the city/town level (henceforth referred to as location/locale here and in the ensuing code).
+While the number of deaths due to COVID-19 are typically reported, data documenting recoveries is lacking including from states suffering significantly from the pandemic.
+Data on recoveries from COVID-19 is the complement to the data on cases from which information on the number of infectious individuals can be inferred.
+Without this necessary data we make a crude estimate on the time course of the infectious compartment based on the World Health Organization's estimate of the average duration of the disease [@WHO].
+
+The results highlight the need for widespread and rapid testing, as well as for continuous monitoring of those infected.
+This code serves as a starting point for expansion of the model to include additional compartments [@AHill].
+Machine learning methods can be used to obtain better estimates for model parameters [@Dandekar].
+Interrupted time series analysis methods can be used to continue to follow the course of the pandemic and to evaluate the various measures implemented that may or may not be intended to curtail the spread of infection [@Siedner].
+
+# The classic SIR Model
+
+In the classic SIR model the population is compartmentalized into the susceptible, the infectious, and the recovered (which also includes the deceased).
+Solving the set of three simultaneous differential equations 
+
+$${\, d S(t) \over \, d t} \, = - \, {\beta \, S(t) \, I(t)\over N}$$
+
+$${\, d I(t) \over \, d t} = {\beta \, S(t) \, I(t)\over N}  - \gamma \, I(t)$$
+$${\, d R(t) \over \, d t} = \gamma \, I (t)$$
+, requires fitting two adjustable parameters, $\beta$ and $\gamma$.
+$\beta$ controls the transition between $S$ and $I$.
+$\gamma$ controls the transition between $I$ and $R$.
+$R_0$, known as the basic reproductive number, is equal to the ratio of $\beta / \gamma$.
+
+The loss function is defined as the residual sum of squares for time evolution of the the number of infected individuals
+
+$$ RSS = \sum_t \biggl( {\hat I}(t) - I(t) \biggr)^2 $$.
+
+
+# Exploratory Data Analysis:
+
+Load relevant packages for data wrangling and analysis.
+
+```{r message=FALSE}
+## Load packages
+
+## Data wrangling
+if(!require(tidyverse)) install.packages("tidyverse",
+                                         repos = "http://cran.us.r-project.org")
+## Work with dates
+if(!require(lubridate)) install.packages("lubridate",
+                                         repos = "http://cran.us.r-project.org")
+## For web scraping
+if(!require(rvest)) install.packages("rvest",
+                                     repos = "http://cran.us.r-project.org")
+## Has unscale(), the opposite of scale()
+if(!require(DMwR)) install.packages("DMwR",
+                                    repos = "http://cran.us.r-project.org")
+## Get kmeans()
+if(!require(caret)) install.packages("caret",
+                                     repos = "http://cran.us.r-project.org")
+## Perform join on imperfect match
+if(!require(fuzzyjoin)) install.packages("fuzzyjoin",
+                                         repos = "http://cran.us.r-project.org")
+## Solve differential equations
+if(!require(deSolve)) install.packages("deSolve",
+                                       repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table",
+                                          repos = "http://cran.us.r-project.org")
+if(!require(knitr)) install.packages("knitr",
+                                     repos = "http://cran.us.r-project.org")
+```
+
+
+
+Download JHU CSSE data sets from GitHub.
+To run this code requires an internet connection.
+
+```{r message=FALSE}
+## Download data set(s) from:
+## Johns Hopkins University Center for Systems Science and Engineering (CSSE)
+
+## CSV file of time series of confirmed cases
+url_jhu_ts_confirmed_US <- paste("https://raw.githubusercontent.com/CSSEGISandData/",
+                      "COVID-19/master/csse_covid_19_data/", "csse_covid_19_time_series/",
+                      "time_series_covid19_confirmed_US.csv", sep="")
+
+confirmed_US <- read_csv(url(url_jhu_ts_confirmed_US))
+
+
+
+## CSV file of time series of COVID-19 deaths
+## This data set also contains the population data
+url_jhu_ts_deaths_US <- paste("https://raw.githubusercontent.com/CSSEGISandData/",
+                      "COVID-19/master/csse_covid_19_data/", "csse_covid_19_time_series/",
+                      "time_series_covid19_deaths_US.csv", sep="")
+
+deaths_US <- read_csv(url(url_jhu_ts_deaths_US))
+```
+
+
+Put data in tidy format, give columns better names, simplify locale names, and convert dates to date class.
+
+```{r}
+## Extract population data from deaths_US data set
+population_data_US <- deaths_US[c("Province_State", "Combined_Key", "Population")]
+population_data_US <- population_data_US %>%
+  rename(State = "Province_State", Locale = "Combined_Key") %>% # Rename columns
+  mutate(Locale = str_remove(Locale, ", US"))                   # Remove country spec
+
+
+## Remove columns: UID, iso2, iso3, code3, FIPS, Admin2, Country_Region, Lat, Long
+## Keep columns: Province_State, Combined_Key, and columns corresponding to dates
+confirmed_US <- confirmed_US[,-c(seq(1,6), seq(8,10))]
+
+## Keep columns: Province_State, Combined_Key, and columns corresponding to dates
+## Omit column 12: Population
+deaths_US <- deaths_US[,-c(seq(1,6), seq(8,10), 12)]
+
+
+## Rename fields containing detailed location data
+confirmed_US <- confirmed_US %>% rename(State = "Province_State", Locale = "Combined_Key")
+deaths_US    <- deaths_US    %>% rename(State = "Province_State", Locale = "Combined_Key")
+
+
+## Put data in tidy format
+confirmed_US <- confirmed_US %>%
+  pivot_longer(
+    
+    cols = -c(State, Locale),
+    names_to  = "Date",
+    values_to = "Cases"
+    
+  )
+
+deaths_US <- deaths_US %>%
+  pivot_longer(
+    
+    cols = -c(State, Locale),
+    names_to  = "Date",
+    values_to = "Deaths"
+    
+  )
+
+## Remove string ", US" from Locale field
+confirmed_US <- confirmed_US %>% mutate(Locale = str_remove(Locale, ", US"))
+deaths_US    <- deaths_US    %>% mutate(Locale = str_remove(Locale, ", US"))
+
+
+## Convert dates data to mode date
+confirmed_US <- confirmed_US %>% mutate(Date = mdy(Date))
+deaths_US    <- deaths_US    %>% mutate(Date = mdy(Date))
+
+
+## Join tables by State, Locale, and Date
+## note: data on deaths is not used in the following
+##...this procedure is included here for completeness.
+jhu_US_data <- inner_join(
+  
+  x = confirmed_US,
+  y = deaths_US,
+  by = c(
+    
+    "State" = "State",
+    "Locale" = "Locale",
+    "Date" = "Date"
+    
+    ),
+  keep = FALSE
+ 
+)
+```
+
+Clean data by omitting locales that lack corresponding population data, as well as those that never record any cases.
+
+```{r}
+###############################################################
+## Omit places that do not have any cases from consideration ##
+###############################################################
+
+
+## Find locales that never record any cases
+locales_with_zero_cases <- jhu_US_data %>%
+  group_by(Locale) %>%
+  summarize(sum_cases = sum(Cases)) %>%
+  filter(sum_cases == 0) %>%
+  pull(Locale)
+
+
+## Omit locales with no cases
+jhu_US_data <- jhu_US_data %>%
+  filter(!Locale %in% locales_with_zero_cases)
+
+population_data_US <- population_data_US %>%
+  filter(!Locale %in% locales_with_zero_cases)
+
+
+
+##############################################
+## Omit places that have no population data ##
+##############################################
+
+
+## Note: some Locale listings have Population data equal to zero
+locales_without_population <-
+  population_data_US$Locale[which(population_data_US$Population == 0)]
+
+
+## Remove entries where Population equals zero from the population data set
+population_data_US <- population_data_US %>%
+  filter(Population > 0)
+
+jhu_US_data <- jhu_US_data %>%
+  filter(!Locale %in% locales_without_population)
+```
+
+Define some useful functions for later use.
+
+```{r}
+## Get the date that cases start to appear in a given locale
+get_first_cases_date <- function(location) {
+  
+  jhu_US_data %>%
+    filter(Locale == location, Cases != 0) %>%
+    select(Date)  %>%
+    arrange(Date) %>%
+    pull(Date) %>%
+    head(1)
+ 
+}
+
+
+## Get the date of the most recently reported cases in a given locale
+get_recent_cases_date <- function(location) {
+  
+  jhu_US_data %>%
+    filter(Locale == location, Cases != 0) %>%
+    select(Date) %>%
+    arrange(desc(Date)) %>%
+    pull(Date) %>%
+    head(1)
+  
+}
+
+
+## Get the dates between when 1st and last cases are reported in a given locale
+get_cases_dates <- function(location) {
+  
+  first_cases_date  <- get_first_cases_date(location)
+  
+  recent_cases_date <- get_recent_cases_date(location)
+  
+  jhu_US_data %>%
+    filter(Locale == location) %>%
+    filter(between(Date, first_cases_date, recent_cases_date)) %>%
+    pull(Date)
+  
+}
+
+
+## Get the date that X number of infectious individuals are observed in a given locale
+## Default: X = 5000
+date_of_X_infectious <- function(location, x = 5000) {
+  
+  get_raw_data(location) %>%
+    filter(infected >= x) %>%
+    arrange(date) %>%
+    head(1) %>%
+    pull(date)
+  
+}
+
+
+#######################################################################################
+## Get the raw data for the SIR compartments ##########################################
+## Estimate the number of infectious individuals as:  Infectious = Cases - Recovered ##
+#######################################################################################
+
+get_raw_data <- function(location, lag = 0) {
+  
+  ## Date that cases start to appear
+  first_cases_date <- get_first_cases_date(location)
+  
+  
+  ## Date of the most recently reported cases
+  recent_cases_date <- get_recent_cases_date(location)
+  
+  
+  ## Dates between when the 1st and last cases are reported
+  dates <- get_cases_dates(location)
+  
+  
+  ## Cases between when the 1st and last cases are reported
+  cases <- jhu_US_data %>%
+    filter(Locale == location) %>%
+    filter(between(Date, first_cases_date, recent_cases_date)) %>%
+    pull(Cases)
+  
+  
+  ## Use the average recovery time to estimate the no. of individuals who have recovered.
+  ## WHO estimates an average recovery time of ~2 weeks (14 days).
+  ## Recall: there is no distinction made between recovered and deceased.
+  ## Shift data to the right changing leading positions now with missing values to 0
+  ##... and truncating trailing values past the length of the input vector.
+  recovery_time <- 14 # in days
+  recovered <- c(
+    
+    rep(0, recovery_time),
+    cases[seq(1, length(cases) - recovery_time)]
+    
+  )
+  
+  
+  ## Estimate Infected/Infectious data
+  infected <- cases - recovered
+  
+  
+  ## Index by day since the 1st cases are seen to begin modeling
+  start_index <- 1 + lag
+  
+  ## Index by day since the 1st cases are seen to stop modeling
+  stop_index <- length(cases)
+  
+  
+  return(data.frame(
+    
+    date  = dates[start_index:stop_index],
+    cases = cases[start_index:stop_index],
+    infected  = infected[start_index:stop_index],
+    recovered = recovered[start_index:stop_index]
+    
+    )
+
+  )
+  
+}
+```
+
+# K-means Clustering
+
+K-means clustering is used to identify a manageable subset of the data to focus on.
+Two parameters that can be used for clustering based on the JHU data alone are the population, and the period between when the first cases are observed in the United States and when the first cases are recorded (referred to as the grace period) for a given locale.
+
+```{r}
+######################################################################
+## Preliminary analysis prior to K-means clustering
+## Examine parameters available in JHU data set
+## 1. Population of a given locale
+## 2. The number of days between when cases are 1st reported in the US
+##... and when cases are 1st reported in a given locale
+######################################################################
+
+###################################################
+## Visualize variable for clustering: population ##
+###################################################
+
+## Look at 1st variable considered for clustering: population
+## Visualize locales with population over 100k
+population_data_US %>%
+  filter(Population > 100000) %>%
+  ggplot(aes(Population)) +
+  theme_light() +
+  geom_histogram(binwidth = 500000, fill = "blue", col = "black")
+
+
+
+#####################################################################
+## Generate variable for clustering:  days between 1st recorded    ##
+##... cases in the US and the 1st recorded cases in a given locale ##
+#####################################################################
+
+## The date of the first reported cases in the US
+first_cases_date <- jhu_US_data %>%
+  filter(Cases != 0) %>%
+  arrange(Date) %>%
+  head(1) %>%
+  pull(Date)
+
+
+## Days between when the 1st cases are recorded in the US and
+##... when cases are 1st recorded in a locale, aka grace period
+get_grace_period <- function(x) {
+  
+  jhu_US_data %>%
+    filter(Locale == x, Cases != 0) %>%
+    mutate(Grace_period = as.numeric(Date - first_cases_date, units = "days")) %>%
+    arrange(Date) %>%
+    select(Locale, Grace_period) %>%
+    head(1)
+  
+}
+
+
+## Make vector of locales
+locales <- unique(jhu_US_data$Locale)
+
+
+## Get grace period for each locale
+grace_periods <- map_dfr(locales, get_grace_period)
+
+
+
+#####################################################
+## Visualize variable for clustering: grace period ##
+#####################################################
+
+grace_periods %>%
+  ggplot(aes(Grace_period)) +
+  theme_light() +
+  geom_histogram(binwidth = 5, fill = "blue", col = "black") +
+  labs(x = "Grace Period")
+```
+
+Prepare data for K-means clustering by joining the population and grace period data into a single data frame, scaling the data by computing z-scores, and using the locale as the row name rather than as an explicit column of the data frame.
+
+```{r}
+#########################################
+## Prepare data for K-means Clustering ##
+#########################################
+
+## Combine grace period information with population information
+kmeans_setup <- inner_join(
+
+  x = grace_periods,
+  y = population_data_US,
+  by = c("Locale" = "Locale")
+
+)
+
+
+## Omit State field
+kmeans_setup <- kmeans_setup %>% select(-"State")
+
+
+## Use tibble package to convert Locale field values to row names
+## This is the data.frame structure for K-means
+kmeans_setup <- column_to_rownames(.data = kmeans_setup, var = "Locale")
+
+
+# Compute Z-scores of fields for K-means: Grace_period, Population
+kmeans_setup <- scale(kmeans_setup)
+```
+
+Determine the optimum number of clusters using the "elbow method" [@Hastie].
+
+```{r}
+## K-means clustering
+## Parameters: 2 parameters considered
+## (1) population,
+## (Prefer to use population density but land area info is difficult to obtain)
+## (2) Days between when the 1st cases are documented in the US and
+##... when the 1st cases are documented in a given locale
+
+
+## Set seed of random number generator
+set.seed(2394817)
+
+
+#######################################################
+## Function to compute within-cluster sum of squares ##
+#######################################################
+
+wss <- function(k) {
+
+  kmeans(
+
+    kmeans_setup,
+    centers = k,
+    nstart = 25,
+    iter.max = 20
+ 
+  )$tot.withinss
+ 
+}
+
+
+## Sequence of k-values to test
+k_seq <- seq(1, 15)
+
+
+## Get sequence of within-cluster sum of squares
+wss_seq <- map_dbl(k_seq, wss)
+
+
+## Elbow plot: Plot total intra-cluster variation
+##... (total within-cluster sum of squares) v. the number of clusters
+plot(x = k_seq, y = wss_seq,
+     main = "Total Intra-Cluster Variation",
+     ylab = "Within-Cluster Sum of Squares",
+     xlab = "Number of Clusters")
+
+
+## Plot the percent of variance explained v. the number of clusters
+pve <- -diff(wss_seq)/wss_seq[1:length(wss_seq)-1]
+
+plot(k_seq[2:length(k_seq)], round(pve, 2)*100,
+     main = "Percent of Variance Explained v. Cluster Size",
+     ylab = "Percent of Variance Explained (%)",
+     xlab = "Number of Clusters")
+
+## Set first 0.25 (25%) value as the arbitrary cut-off
+## Observation: 6 clusters brings the pve to about 0.2
+abline(h = 25)
+```
+
+Examine clusters using k = 6.
+
+```{r}
+################################################################
+## Visualize clusters given the optimal number of clusters: 6 ##
+################################################################
+
+## Generate 6 clusters
+kmeans_data <- kmeans(
+ 
+  kmeans_setup,
+  centers  = 6,
+  nstart   = 25,
+  iter.max = 20
+ 
+)
+
+
+## Put cluster data for each locale in a data.frame
+kmeans_data <- data.frame(kmeans_data$cluster)
+
+
+## Rename Cluster field
+kmeans_data <- kmeans_data %>%
+  rename(Cluster = kmeans_data.cluster)
+
+
+## Return locale info in row names to an explicit column (tidy format)
+kmeans_data  <- rownames_to_column(.data = kmeans_data , var = "Locale")
+
+
+## Use unscale() of DMwR package to reverse action of scale() on kmeans_setup
+## Join clustering data with the variables used for clustering
+## Note: here Variables used for clustering have been 'unscaled', that is they
+##... have been returned to their original values from the z-scores.
+clustering_data <- inner_join(
+
+  x = kmeans_data,
+  y = rownames_to_column(
+ 
+    .data = data.frame(unscale(kmeans_setup, kmeans_setup)),
+    var = "Locale"
+
+  ),
+  by = c("Locale" = "Locale")
+ 
+)
+```
+
+```{r cluster_vis, echo=FALSE}
+## Plot clusters
+clustering_data %>%
+  ggplot(aes(Grace_period, Population, col = Cluster)) +
+  geom_point() +
+  scale_color_gradientn(colours = rainbow(6)) +
+  theme_light() +
+  labs(
+    
+    title = "K-means Clustering Analysis",
+    subtitle = "of Locales in JHU CSSE Data Set",
+    caption = "*Grace period : days between the 1st recorded cases in the US and the 1st recorded cases for a given locale",
+    x = "Grace Period (Days)",
+    y = "Population",
+    color = "Cluster"
+    
+  ) +
+  theme(
+    
+    plot.title    = element_text(hjust =  0.5),
+    plot.subtitle = element_text(hjust =  0.5),
+    axis.title.y  = element_text(vjust =  3.0),
+    axis.title.x  = element_text(vjust = -1.0),
+    plot.caption  = element_text(vjust = -2.0, hjust = 0.35)
+    
+  )
+
+## NOTE: the cluster ID can change from one K-means run to the next
+```
+
+We focus on the cluster containing New York City, NY.
+
+```{r}
+## Get cluster containing NYC, NY
+nyc_cluster_id <- clustering_data %>%
+  filter(Locale == "New York City, New York") %>%
+  pull(Cluster)
+
+
+## Get info for locales in same cluster as NYC, NY
+nyc_cluster <- clustering_data %>%
+  filter(Cluster == nyc_cluster_id)
+
+
+# Show info for the cluster containing New York City, NY
+nyc_cluster
+```
+
+Given that Maricopa, AZ, Los Angeles, CA, and Cook, IL, document cases well before New York City, NY, and Harris, TX, despite being in the same cluster, the former set of locales will be used to make predictions about the latter.
+We take a closer look at the data before proceeding with modeling.
+
+```{r , echo=FALSE}
+## Plot the number of cases v. the date for a given locale
+
+p1 <- get_raw_data("Maricopa, Arizona") %>% # obs: 3 humps
+  ggplot(aes(x = date, y = infected)) +
+  geom_line() +
+  theme_light() +
+  labs(
+ 
+    title = "Maricopa, AZ",
+    #caption = ,
+    x = "Date",
+    y = "Number of Infectious Individuals"
+ 
+  ) +
+  theme(
+ 
+    plot.title    = element_text(hjust =  0.5),
+    plot.subtitle = element_text(hjust =  0.5),
+    axis.title.y  = element_text(vjust =  3.0),
+    axis.title.x  = element_text(vjust = -1.0)
+ 
+  )
+
+p2 <- get_raw_data("Los Angeles, California") %>% # obs: 3+ humps
+  ggplot(aes(x = date, y = infected)) +
+  geom_line() +
+  theme_light() +
+  labs(
+ 
+    title = "Los Angeles, CA",
+    y = "",
+    x = "Date"
+
+  ) +
+  theme(
+ 
+    plot.title    = element_text(hjust =  0.5),
+    plot.subtitle = element_text(hjust =  0.5),
+    axis.title.y  = element_text(vjust =  3.0),
+    axis.title.x  = element_text(vjust = -1.0)
+ 
+  )
+
+p3 <- get_raw_data("Cook, Illinois") %>%   # obs: ok
+  ggplot(aes(x = date, y = infected)) +
+  geom_line() +
+  theme_light() +
+  labs(
+ 
+    title = "Cook, IL",
+    y = "",
+    x = "Date"
+ 
+  ) +
+  theme(
+ 
+    plot.title    = element_text(hjust =  0.5),
+    plot.subtitle = element_text(hjust =  0.5),
+    axis.title.y  = element_text(vjust =  3.0),
+    axis.title.x  = element_text(vjust = -1.0)
+ 
+  )
+
+grid.arrange(p1, p2, p3, ncol=3,
+             top = textGrob("Infectious v. Date",gp=gpar(fontsize=20,font=1)))
+```
+
+Data for Maricopa, AZ, and Los Angeles, CA, look fairly irregular.
+For simplicity we therefore will use Cook, IL, as a basis for developing the SIR model before applying it to make predictions about New York City, NY.
+
+# Procedure: The SIR Model in R
+
+Define the loss function as the residual sum of squares (RSS) and use it to evaluate the SIR model [@Choisy2018; @Churches2020covid19part1].
+To estimate the number of infectious individuals, we assume that one is either dead or recovered after two weeks (WHO), and subtract the number of cases two weeks prior from the number of cases on a given day.
+This gross estimate is necessary due to a lack of data on COVID-19 recoveries.
+
+```{r}
+## Define loss function as residual sum of squares
+RSS <- function(prediction, raw_data) {
+  
+  return( sum( (prediction - raw_data)^2 ) )
+  
+}
+
+
+## Define SIR model
+SIR <- function(time, sir_variables, sir_parameters) {
+  
+  with(as.list(c(sir_variables, sir_parameters)), {
+    
+    dS <- - beta * S * I / N
+    dI <-   beta * S * I / N - gamma * I
+    dR <-  gamma * I
+    
+    return( list( c(dS, dI, dR) ) )
+    
+  })
+
+}
+```
+
+Define functions for evaluating the SIR model based on the loss (RSS) function.
+
+```{r}
+####################################################
+## Define function to apply SIR model to raw data ##
+####################################################
+
+## Input parameters:
+## args  <vector of doubles> - beta and gamma (in that order) coefficients in SIR model.
+## Note: this function takes parameters beta and gamma as 
+##... a single vector for compatibility with optim().
+## location  <string> - "city/town, state" format, ie: "New York City, New York".
+## lag  <int> - skip this number of days since the 1st cases are seen
+##... before we begin modeling the data.
+
+fit_SIR_model <- function(args, location = "New York City, New York", lag = 0) {
+
+  #####################################
+  ## Define parameters for SIR model ##
+  #####################################
+
+  ## Set beta and gamma parameter values from input
+  ## Convert parameters passed as strings to numbers
+  parameter_values <- as.numeric(args)
+
+
+  ## Calculate the population for the given location
+  N <- population_data_US %>%
+    filter(Locale == location) %>%
+    pull(Population)
+
+  ## Append population data to SIR parameters
+  parameter_values <- append(parameter_values, N)
+ 
+ 
+  ## ode() requires parameters be passed as a vector with named components
+  parameter_values <- setNames(parameter_values, c("beta", "gamma", "N"))
+ 
+ 
+ 
+  #########################################
+  ## Get raw data for specified location ##
+  #########################################
+ 
+  raw_data <- get_raw_data(location)
+
+ 
+ 
+  ###########################################
+  ## Make a vector to increment dates/time ##
+  ###########################################
+ 
+  ## Note: The deSolve function ode() is old-school and does not accept date objects.
+  ## Set a lag value to test the influence on fitting of starting at a later date
+  days <- 1:(length(raw_data$infected) - lag)
+ 
+ 
+ 
+  ##############################################
+  ## Set initial conditions for the SIR model ##
+  ##############################################
+ 
+  ## Set a lag value to test the influence on fitting of starting at a later date
+  model_start_day <- 1 + lag
+ 
+  initial_values <- c(
+ 
+    S = N - raw_data$infected[model_start_day],  # number of susceptible people
+    I = raw_data$infected[model_start_day],      # no. infectious
+    R = raw_data$recovered[model_start_day]      # no. recovered (and immune), or deceased
+ 
+  )
+ 
+ 
+ 
+  ########################
+  ## Evaluate SIR Model ##
+  ########################
+ 
+  ## Solve system of 3 simultaneous equations
+  predictions <- ode(
+ 
+    y = initial_values,
+    times = days,
+    func  = SIR,
+    parms = parameter_values
+ 
+  )
+ 
+ 
+  return(data.frame(predictions))
+ 
+}
+
+
+
+###########################################################################
+## Evaluate the fit using the SIR model based on the (RSS) loss function ##
+###########################################################################
+
+get_SIR_fit_RSS <- function(args, location, lag) {
+ 
+  ## Extract raw data
+  raw_data <- get_raw_data(location, lag)
+ 
+ 
+  ## Compute fitted data
+  fit_data <- fit_SIR_model(args, location, lag)
+ 
+ 
+  ## Compute the residual sum of squares for fit v. raw for infectious data
+  return( RSS(fit_data$I, raw_data$infected) )
+ 
+}
+
+
+
+#############################################################
+## Evaluate the SIR model based on the (RSS) loss function ##
+#############################################################
+
+## n  - is the number of values of beta and gamma to test
+## Gamma can be estimated based on the average duration of the illness,
+##... as 1/(duration of illness)
+## Upper boundary of 0.2 based on guess of quickest recovery of 5 days
+## There is no good way to guess the value of beta
+## Guess upper boundary of 0.8 based on the ave. R_0 of ~ 2 for the 1918 Spanish Flu
+## Recall: R_0 = beta / gamma
+
+run_SIR_RSS_tests <- function(
+ 
+  beta_seq = betas,
+  gamma_seq = gammas,
+  n = 10,
+  location, lag
+ 
+  ) {
+
+  ## Create a set of betas and gammas to test.
+  ## Generate all combinations of beta and gamma values.
+  ## Result is an object of class: data.frame, and mode: list
+  parameter_set <- expand.grid(beta_seq, gamma_seq)
+
+  ## Rename Var1 and Var2 columns to beta and gamma
+  names(parameter_set) <- c("beta", "gamma")
+
+
+  ## Combine column entries into single row vector to pass elements
+  ##... as single parameter vector to get_sir_fit_rss()
+  ##... this is less of an aesthetic choice than a need to conform 
+  ##... to the same argument specifications as optim()
+  ##... such that the same function that is used to evaluate the model
+  ##... can be used for optimization.
+  ## The result is rows of string vectors (having trouble converting to numeric vector).
+  parameter_set <- parameter_set %>%
+    transmute(parameters = as.vector(strsplit(paste(beta, gamma), " ")))
+
+
+  ## Compute RSS for SIR model on COVID-19 data for combinations
+  ##... of beta and gamma test values
+  rss_tests_results <- parameter_set %>%
+    mutate(
+
+      values = map(
+
+        parameters,
+        get_SIR_fit_RSS,
+        location = location,
+        lag = lag
+
+        )
+
+      )
+
+
+  return(rss_tests_results)
+
+}
+```
+
+Set parameters and evaluate the SIR model.
+
+```{r}
+## Specify the name of the location to examine
+## To see a list of available locations use: unique(dat$Locale)
+the_location = "Cook, Illinois"
+
+
+## Set number of days to skip since the 1st cases are seen before
+##... we begin modeling the data
+## Set lag based on when 5000 people become infected/infectious
+the_lag <-
+  as.numeric(date_of_X_infectious(the_location) - get_first_cases_date(the_location))
+
+
+## Set the number of beta and the number of gamma values to test.
+## (n) must be large enough to achieve sufficient granularity
+##... such that a reasonable pair of beta and gamma values can be
+##... found to begin optimization with an expectation of a descent fit.
+## n = 10 in general is not large enough but runs in a reasonable amount of time.
+n = 10
+
+## Set upper boundaries for beta and gamma values
+gamma_min = 0.0
+gamma_max = 1.0
+beta_min  = 0.0
+beta_max  = 1.0
+
+## Define sequence of beta and gamma values to test
+betas  <- seq(beta_min , beta_max , len=n)
+gammas <- seq(gamma_min, gamma_max, len=n)
+
+
+## Evaluate SIR model
+rss_tests_results <- run_SIR_RSS_tests(location = the_location, lag = the_lag)
+```
+
+It is apparent from the heat map of RSS values for the range of beta and gamma values tested that there are many possible beta and gamma pairs.
+
+```{r , echo=FALSE}
+#########################################
+## Visualize the Model Evaluation Data ##
+#########################################
+
+
+## Convert data from RSS tests into matrix format
+## Row values correspond to beta index
+## Column values correspond to gamma index
+
+rss_tests_values <- matrix(unlist(rss_tests_results$values), sqrt(length(rss_tests_results$values)))
+
+
+
+## 2D contour plot of RSS tests data
+## To see available palettes use: hcl.pals()
+## https://developer.r-project.org/Blog/public/2019/04/01/hcl-based-color-palettes-in-grdevices/
+
+visualize_data <- function(beta_seq, gamma_seq, rss_values_matrix) {
+
+  require(grDevices)
+    
+  lvls <- seq(min(rss_tests_values), max(rss_tests_values), le = 50)
+  
+  filled.contour(
+    
+    x = beta_seq,
+    y = gamma_seq,
+    z = rss_values_matrix,
+    xlim = c(min(betas), max(betas)),
+    ylim = c(min(gammas), max(gammas)),
+    zlim = c(min(rss_values_matrix), max(rss_values_matrix)),
+    col  = hcl.colors(
+      n = 100,
+      palette = "Viridis",
+      alpha = 0.5,
+      rev = FALSE,
+      fixup = TRUE
+    ),
+    levels = lvls,
+    main = bquote(.(the_location)),
+    sub  = list(bquote("*Days since the first cases are detected before modeling starts: " ~ .(the_lag)), cex = 0.75),
+    ylab = expression(paste("recovery rate  ", gamma, " (/day)")),
+    xlab = "",
+    xaxs = "i", yaxs = "i",
+    key.title = title(main = bquote("RSS("~beta~","~gamma~")"), cex.main = 0.85),
+    plot.axes = {
+      
+      contour(
+        
+        x = betas,
+        y = gammas,
+        z = rss_tests_values,
+        add  = TRUE,
+        axes = FALSE,
+        drawlabels = FALSE
+      
+        );
+
+      axis(1); axis(2) # must add back axes explicitly
+
+    }
+
+  )
+  
+  # Adjust x-axis label only: shift up from subtitle
+  mtext(
+    
+    text = expression(paste("infection rate ", beta,  " (/day)")),
+    side = 1, # bottom x-axis
+    line = 2.5
+    
+  )
+  
+  ## Show min and max RSS values for beta and gamma pairs tested
+  print("Minimum RSS:")
+  print(min(rss_values_matrix))
+  print("Maximum RSS:")
+  print(max(rss_values_matrix))
+  
+}
+
+
+## Visualize RSS values for beta and gamma pairs using head map and contour lines
+visualize_data(betas, gammas, rss_tests_values)
+```
+
+Optimization is performed using the L-BFGS-B method [@Byrd1995] on model fitting using the pair of beta and gamma values obtained from preliminary RSS tests as starting conditions.
+
+```{r}
+## Use an informed guess for beta and gamma to optimize fit
+
+## Starting values for SIR parameters beta and gamma to perform optimization
+starting_optimization_parameters <-
+  unlist(rss_tests_results$parameters[which.min(rss_tests_results$values)])
+
+
+## Perform optimization
+optim_model <- optim(
+
+  par = starting_optimization_parameters, # initial values for the parameters
+  location = the_location,  # parameter to get_SIR_fit_RSS() specifying city/location
+  lag = the_lag,            # parameter to get_SIR_fit_RSS() specifying model lag 
+  fn  = get_SIR_fit_RSS,    # Function to be minimized: RSS of SIR fit
+  method = "L-BFGS-B" ,     # Gradient projection method using BFGS matrix
+  lower  = c(0, 0),         # lower boundary for beta and gamma
+  upper  = c(1, 1)          # upper boundary for beta and gamma
+
+)
+
+
+## Check for convergence
+optim_model$message
+
+## Check convergence: 0 for L-BFGS-G method indicates successful completion
+optim_model$convergence
+
+min_rss <- optim_model$value
+min_rss
+
+## Check fitted values
+params_optim <- setNames(optim_model$par, c("beta", "gamma"))
+beta_optim   <- params_optim[["beta"]]
+beta_optim
+gamma_optim  <- params_optim[["gamma"]]
+gamma_optim
+
+
+## Compute R_0 = beta / gamma
+R0  <- params_optim[["beta"]] / params_optim[["gamma"]]
+R0
+```
+
+Plot the optimized fit and the raw data for Cook, IL.
+
+```{r , echo=FALSE}
+
+fit <- fit_SIR_model(params_optim, the_location, the_lag)
+raw <- get_raw_data(the_location, the_lag) %>%
+  mutate(time = seq(1, length(date)))
+
+## Combine SIR fit data, raw JHU cases data, and specified range of dates.
+fit_and_raw_data <- full_join(fit, raw, by = "time", keep = FALSE)
+
+
+## Rename variables
+fit_and_raw_data <- fit_and_raw_data %>%
+  rename(
+
+    fit_S = S,
+    fit_I = I,
+    fit_R = R,
+    raw_I = infected,
+    raw_R = recovered
+
+  )
+
+
+## Convert wide data to tidy data
+fig_data <- fit_and_raw_data %>%
+  select(date, fit_I, raw_I) %>%
+  rename(
+
+    raw = raw_I,
+    fit = fit_I
+
+  ) %>%
+  pivot_longer(
+
+    cols      = -c("date"),
+    names_to  = "data",
+    values_to = "infected"
+
+  )
+
+
+#####################
+## Plot data + fit ##
+#####################
+
+fig_data %>%
+  ggplot(aes(x = date, y = infected, color = data)) +
+  geom_line() +
+  theme_light() +
+  labs(
+    
+    title = "Infectious (\"I\" of SIR Model) v. Date",
+    subtitle = bquote(.(the_location) ~ ":"
+                      ~beta  == .(round(beta_optim,  2))~","
+                      ~gamma == .(round(gamma_optim, 2))~"," 
+                      ~ R[0] == .(round(R0, 2)) ),
+    caption = bquote("*Days since the first cases are detected before modeling starts: " ~ .(the_lag)),
+    x = "Date",
+    y = "Number of Infectious Individuals",
+    color = "Key:"
+
+  ) +
+  scale_color_manual(values=c("#0072B2", "#D55E00")) +
+  theme(
+
+    plot.title    = element_text(hjust =  0.5),
+    plot.subtitle = element_text(hjust =  0.5),
+    axis.title.y  = element_text(vjust =  3.0),
+    axis.title.x  = element_text(vjust = -1.0),
+    plot.caption  = element_text(vjust = -2.0, hjust = 1.0)
+
+  )
+```
+
+# Results
+
+Exploratory data analysis using K-means clustering shows six clusters may be sufficient to group the data based on population and grace period. 
+Ideally we would like to perform clustering based on population density instead of population, however the land area data for the US was not easy to obtain because the US Census data assigns different names to places than the JHU CSSE data set.
+Furthermore, only land area data from 1990 is available.
+In principle the data could be obtained using modern tools such as fuzzy join, ie:
+
+```{r eval=FALSE}
+## Define a vectorized-function for evaluating fuzzy logic
+fuzzy <- Vectorize( function(x, y) {
+  
+  return(isTRUE(as.logical(agrep(x, y))))
+  
+})
+
+
+## Perform fuzzy join
+testing_df2 <- fuzzy_inner_join(
+  jhu_US_data,
+  census_data,
+  by = c(
+    
+    "State"  = "State_Name",
+    "Locale" = "Locale_Name"
+    
+    ),
+  match_fun = fuzzy
+  
+)
+```
+
+The fit using the SIR model is bad when staring from a low number of infectious individuals (data not shown).
+The fit improves when applied at a later date, when the number of cases is larger.
+Larger initial values for the number of infectious individuals usually results in better fits.
+The choice of 5000 infectious/infected is chosen because it permits good fitting of the data for Cook, IL.
+The heat map (shown above) of RSS values for the range of beta and gamma values tested reveals that there is a wide range of possible beta and gamma pairs.
+The model parameters from optimization are $\beta = 0.76$, and $\gamma = 0.7$, which produce $R_0 = 1.09$.
+Data for Los Angeles, CA, and Maricopa, AZ, are somewhat irregular and are not used for model development.
+The result of using this model to make predictions about New York City, NY, which begins to experience cases a little over a month after Cook, IL, is shown below.
+
+```{r apply_model, echo=TRUE}
+########################################################################
+## Apply SIR Model for Prediction ######################################
+## Apply model gleaned from Cook, Illinois to New York City, New York ##
+########################################################################
+
+
+## Set locale
+the_location = "New York City, New York"
+
+## Set lag based on when 5000 people become infected/infectious
+the_lag <-
+  as.numeric(date_of_X_infectious(the_location) - get_first_cases_date(the_location))
+
+
+## Use informed guess for beta and gamma based on optimized fit for Cook, Illinois
+## So keep beta and gamma, and R_0 remains unchanged
+fit <- fit_SIR_model(params_optim, the_location, the_lag)
+raw <- get_raw_data(the_location, the_lag) %>%
+  mutate(time = seq(1, length(date)))
+```
+
+```{r apply_model_vis, echo=FALSE}
+## Combine SIR fit data, raw JHU cases data, and specified range of dates.
+fit_and_raw_data <- full_join(fit, raw, by = "time", keep = FALSE)
+
+
+## Rename variables
+fit_and_raw_data <- fit_and_raw_data %>%
+  rename(
+    
+    fit_S = S,
+    fit_I = I,
+    fit_R = R,
+    raw_I = infected,
+    raw_R = recovered
+    
+  )
+
+
+## Convert wide data to tidy data
+fig_data <- fit_and_raw_data %>%
+  select(date, fit_I, raw_I) %>%
+  rename(
+    
+    raw = raw_I,
+    fit = fit_I
+    
+  ) %>%
+  pivot_longer(
+    
+    cols      = -c("date"),
+    names_to  = "data",
+    values_to = "infected"
+    
+  )
+
+
+#####################
+## Plot data + fit ##
+#####################
+
+fig_data %>%
+  ggplot(aes(x = date, y = infected, color = data)) +
+  geom_line() +
+  theme_light() +
+  labs(
+    
+    title = "Infectious v. Date",
+    subtitle = bquote(.(the_location) ~ ":"
+                      ~beta  == .(round(beta_optim, 2)) ~ ","
+                      ~gamma == .(round(gamma_optim, 2)) ~ ","
+                      ~R[0]  == .(round(R0, 2))),
+    caption = bquote(
+      
+      "*Days since the first cases are detected before modeling starts: " ~ .(the_lag)
+      
+      ),
+    x = "Date",
+    y = "Number of Infectious Individuals",
+    color = "Key:"
+    
+  ) +
+  scale_color_manual(values=c("#0072B2", "#D55E00")) +
+  theme(
+    
+    plot.title    = element_text(hjust =  0.5),
+    plot.subtitle = element_text(hjust =  0.5),
+    axis.title.y  = element_text(vjust =  3.0),
+    axis.title.x  = element_text(vjust = -1.0),
+    plot.caption  = element_text(vjust = -2.0, hjust = 1.0)
+    
+  )
+```
+
+It is apparent that the prediction made for NYC, NY, based on Cook, IL, is not good.
+It does not accurately predict the time course nor the magnitude of the infectious population.
+Fitting the SIR model can be applied directly to the NYC, NY, data given the outbreak in NYC is now already well under way.
+We optimize the fit of the SIR model to the data for NYC, NY, starting with the optimal parameters for Cook, IL.
+The SIR model is fairly sensitive to values of $\beta$ and $\gamma$, and modest adjustments can lead to significant improvements.
+Convergence is achieved, which results in the following model fit.
+
+```{r , echo=FALSE}
+optim_model <- optim(
+
+  par = params_optim, # initial values for the parameters to be optimized over.
+  location = the_location,  # parameter to get_SIR_fit_RSS() specifying city/location
+  lag = the_lag,            # parameter to get_SIR_fit_RSS() specifying model lag 
+  fn  = get_SIR_fit_RSS,    # Function to be minimized: RSS of SIR fit
+  method = "L-BFGS-B" ,     # Gradient projection method using BFGS matrix
+  lower  = c(0, 0),         # lower boundary for beta and gamma
+  upper  = c(1, 1)          # upper boundary for beta and gamma
+
+)
+
+
+## Check for convergence
+#optim_model$message
+
+## Check convergence: 0 for L-BFGS-G method indicates successful completion
+#optim_model$convergence
+
+min_rss <- optim_model$value
+
+## Check fitted values
+params_optim <- setNames(optim_model$par, c("beta", "gamma"))
+beta_optim   <- params_optim[["beta"]]
+gamma_optim  <- params_optim[["gamma"]]
+
+
+## Compute R_0 = beta / gamma
+R0  <- params_optim[["beta"]] / params_optim[["gamma"]]
+
+
+fit <- fit_SIR_model(params_optim, the_location, the_lag)
+```
+
+```{r nyc_fit, echo=FALSE}
+## Combine SIR fit data, raw JHU cases data, and specified range of dates.
+fit_and_raw_data <- full_join(fit, raw, by = "time", keep = FALSE)
+
+
+## Rename variables
+fit_and_raw_data <- fit_and_raw_data %>%
+  rename(
+
+    fit_S = S,
+    fit_I = I,
+    fit_R = R,
+    raw_I = infected,
+    raw_R = recovered
+
+  )
+
+
+## Convert wide data to tidy data
+fig_data <- fit_and_raw_data %>%
+  select(date, fit_I, raw_I) %>%
+  rename(
+
+    raw = raw_I,
+    fit = fit_I
+
+  ) %>%
+  pivot_longer(
+
+    cols = -c("date"),
+    names_to = "data",
+    values_to = "infected"
+
+  )
+
+
+#####################
+## Plot data + fit ##
+#####################
+
+fig_data %>%
+  ggplot(aes(x = date, y = infected, color = data)) +
+  geom_line() +
+  theme_light() +
+  labs(
+    
+    title = "Infectious v. Date",
+    subtitle = bquote(.(the_location) ~ ":"
+                      ~beta  == .(round(beta_optim,  2))~","
+                      ~gamma == .(round(gamma_optim, 2))~"," 
+                      ~ R[0] == .(round(R0, 2)) ),
+    caption = bquote("*Days since the first cases are detected before modeling starts: " ~ .(the_lag)),
+    x = "Date",
+    y = "Number of Infectious Individuals",
+    color = "Key:"
+
+  ) +
+  scale_color_manual(values=c("#0072B2", "#D55E00")) +
+  theme(
+
+    plot.title    = element_text(hjust =  0.5),
+    plot.subtitle = element_text(hjust =  0.5),
+    axis.title.y  = element_text(vjust =  3.0),
+    axis.title.x  = element_text(vjust = -1.0),
+    plot.caption  = element_text(vjust = -2.0, hjust = 1.0)
+
+  )
+```
+
+# Discussion
+
+The basic question we are trying to answer through modeling is after the first COVID-19 cases are observed in a locale how long will it be until the surge occurs if no interventions take place?
+However, the SIR model does not allow us to accurately make this prediction.
+The SIR model is only able to fit the data once the outbreak is already in progress.
+Others have responded to this ambiguity by modeling the cumulative number of cases, the raw JHU data, rather than attempt to estimate the number of infectious individuals [@Churches2020covid19part1].
+While this approach has no theoretical justification for implementing the SIR model the data may nonetheless more accurately represent the infectious population, but only in the expansion phase.
+As such, adequate testing would certainly improve modeling efforts.
+In addition, we had to make gross estimates about the infectious and recovered compartments of the SIR model due to a woeful lack of data on recoveries.
+States with thousands of COVID-19 cases like California, Georgia, Illinois, Florida, and Massacheusets have little or no data on recoveries in the JHU CSSE data sets.
+However, the SIR model in itself may not be sufficiently complex to describe disease spread due to the unique characteristics of COVID-19 and due to the complexity of actual human interactions.
+Its biggest drawback is that it gives predictions for the rate of infection when cases are on the rise that is initially lower than what is actually observed, as seen in the fit for NYC, NY.
+
+Clustering is an important facet of modeling the spread of infectious disease.
+It is an attempt to compartmentalize (not to be confused with compartments of the SIR model) some of the epidemiological complexity by grouping entities (locales/subpopulations) that share certain key characteristics.
+Population and grace period are clearly not sufficient clustering parameters.
+Population density would likely be a step in the right direction. 
+The parameter $\gamma$, related to the recovery time, is intrinsically related to the virus.
+Cohort studies, in which the population of infectious individuals is roughly controlled for, can greatly improve estimates for $\gamma$.
+Nonetheless, the parameter $\beta$, while related to the virus, is also dependent on the locale where the virus is spreading.
+Therefore, adequate testing of the population as well as continued monitoring of those infected are crucial for applying modeling efforts to control the spread of COVID-19.
+
+## References
+
+
