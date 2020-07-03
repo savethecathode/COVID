@@ -5,8 +5,8 @@ subDir  <- "COVID19_jhu_ts_data/"
 
 ifelse(!dir.exists(file.path(mainDir, subDir)), dir.create(file.path(mainDir, subDir)), FALSE)
 # dir.create() does not crash if the directory already exists, it just prints out a warning.
-# To supress warnings, set uption: showWarnings = FALSE
-# returns FALSE if the directory already exists or is uncreatable, and TRUE if it didn't exist but was succesfully created.
+# To suppress warnings, set option: showWarnings = FALSE
+# returns FALSE if the directory already exists or is un-creatable, and TRUE if it didn't exist but was successfully created.
 # note: it's not good practice to use ifelse() for non-vectorised branching
 
 file_name <- paste0("jhu_ts_data_US_", Sys.Date(), ".csv")
